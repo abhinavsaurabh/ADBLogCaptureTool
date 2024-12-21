@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, PhotoImage
+from tkinter import ttk, filedialog, messagebox
 import subprocess
 import threading
 import os
@@ -9,24 +9,16 @@ class ADBLogCaptureApp:
     """
     ADB Log Capture Tool
 
-    This tool provides a GUI for capturing dmesg, xlog, and logcat logs from an Android device.
+    This tool provides a simple GUI for capturing dmesg, xlog, and logcat logs
+    from an Android device. It allows selecting the output directory, optionally
+    naming the iteration folder, choosing which logs to capture, and starting/stopping
+    the logging process. Upon stopping, it opens the directory with the collected logs.
     """
 
     def __init__(self, master):
         self.master = master
         self.master.title("ADB Log Capture")
-
-        # Set the window icon (attempt both .ico and .png for compatibility)
-        try:
-            self.master.iconbitmap("adb_log_icon.ico")  # Preferred for Windows
-        except Exception as e:
-            print(f"Error with .ico file: {e}")
-            try:
-                icon = PhotoImage(file="adb_log_icon.png")  # Fallback for cross-platform
-                self.master.iconphoto(True, icon)
-            except Exception as e:
-                print(f"Error with .png file: {e}")
-
+        
         # Variables for logging control
         self.stop_requested = False
         self.dmesg_thread = None
@@ -58,12 +50,22 @@ class ADBLogCaptureApp:
         self.master.config(menu=menubar)
 
     def setup_ui(self):
-        """Set up the main user interface."""
+        """Set up the main user interface using a grid layout."""
+        # Use a uniform font for better aesthetics
+        default_font = ("Segoe UI", 10)
+
+        self.master.option_add("*Font", default_font)
+        self.master.option_add("*Button.Padding", 5)
+        self.master.option_add("*Label.Padding", 5)
+        
+        # Main frame (holds everything)
         main_frame = ttk.Frame(self.master, padding="20 20 20 20")
         main_frame.grid(row=0, column=0, sticky="nsew")
 
+        # Configure row/column stretching
         self.master.rowconfigure(0, weight=1)
         self.master.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(7, weight=1)
 
         # Title
         title_label = ttk.Label(main_frame, text="ADB Log Capture Tool", font=('Segoe UI', 16, 'bold'))
@@ -121,9 +123,12 @@ class ADBLogCaptureApp:
         self.status_label = ttk.Label(main_frame, text="Status: Not started.", anchor="w", font=("Segoe UI", 9, "italic"))
         self.status_label.grid(row=6, column=0, columnspan=2, sticky="ew")
 
+        # Add some stretch so the UI doesn't collapse
+        main_frame.rowconfigure(6, weight=1)
+
     def show_about(self):
         """Display the about information."""
-        messagebox.showinfo("About", "Author: Abhinav Saurabh")
+        messagebox.showinfo("About", "Author: Abhinav Saurabh (Display Team)")
 
     def browse_directory(self):
         """Open a file dialog to browse for the output directory."""
@@ -135,16 +140,19 @@ class ADBLogCaptureApp:
         """Start capturing selected logs."""
         self.stop_requested = False
 
+        # Check if at least one log is selected
         if not (self.capture_dmesg.get() or self.capture_xlog.get() or self.capture_logcat.get()):
             messagebox.showwarning("No Logs Selected", "Please select at least one log type to capture.")
             return
 
+        # Validate output directory
         if not os.path.isdir(self.output_dir.get()):
             messagebox.showerror("Error", "The selected output directory does not exist.")
             return
 
         self.update_status("Preparing device...")
 
+        # Determine run directory name
         custom_name = self.iteration_name.get().strip()
         if custom_name:
             folder_name = f"logs_{custom_name}"
@@ -155,32 +163,117 @@ class ADBLogCaptureApp:
         self.run_directory = os.path.join(self.output_dir.get(), folder_name)
         os.makedirs(self.run_directory, exist_ok=True)
 
+        # Prepare device (may require a rooted device)
+        self.run_adb_command("root")
+        self.run_adb_command("remount")
+        self.run_adb_command("shell mount -t debugfs none /sys/kernel/debug")
+        self.run_adb_command("logcat -c")
+        self.run_adb_command("logcat -G 256M")
+
+        # Disable start, enable stop
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
 
+        # Start capturing logs in separate threads
         self.update_status("Starting logging...")
+
+        if self.capture_dmesg.get():
+            dmesg_path = os.path.join(self.run_directory, "dmesg.txt")
+            self.dmesg_thread = threading.Thread(target=self.capture_output, args=(["adb", "shell", "dmesg", "-w"], dmesg_path, "dmesg_proc"))
+            self.dmesg_thread.start()
+
+        if self.capture_xlog.get():
+            xlog_path = os.path.join(self.run_directory, "xlog_out.txt")
+            self.xlog_thread = threading.Thread(target=self.capture_output, args=(["adb", "shell", "while true; do cat /d/dri/0/debug/dump; echo \"newdump\"; done;"], xlog_path, "xlog_proc"))
+            self.xlog_thread.start()
+
+        if self.capture_logcat.get():
+            logcat_path = os.path.join(self.run_directory, "logcat.txt")
+            self.logcat_thread = threading.Thread(target=self.capture_output, args=(["adb", "logcat"], logcat_path, "logcat_proc"))
+            self.logcat_thread.start()
+
+        self.update_status(f"Logging started. Logs are being saved to: {self.run_directory}")
 
     def stop_logging(self):
         """Stop logging processes and open the run directory."""
         self.update_status("Stopping logging...")
         self.stop_requested = True
 
+        # Terminate processes
+        for proc in [self.dmesg_proc, self.xlog_proc, self.logcat_proc]:
+            if proc and proc.poll() is None:
+                proc.terminate()
+
+        # Wait for threads to finish
+        if self.dmesg_thread: self.dmesg_thread.join(timeout=2)
+        if self.xlog_thread: self.xlog_thread.join(timeout=2)
+        if self.logcat_thread: self.logcat_thread.join(timeout=2)
+
+        # Restore button states
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
         self.update_status("Logging stopped.")
 
+        # Open the folder where logs were stored
         if self.run_directory and os.path.isdir(self.run_directory):
-            os.startfile(self.run_directory)  # Opens folder in Windows
+            os.startfile(self.run_directory)  # Windows-specific
+
+    def capture_output(self, cmd, filename, proc_attr):
+        """
+        Captures the output of a subprocess command and writes it to a file.
+        Uses creationflags to prevent console windows.
+        """
+        creationflags = 0
+        if os.name == 'nt':
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        with open(filename, "w", encoding="utf-8") as f:
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                creationflags=creationflags
+            )
+            setattr(self, proc_attr, p)
+            for line in p.stdout:
+                if self.stop_requested:
+                    break
+                f.write(line)
+            if self.stop_requested and p.poll() is None:
+                p.terminate()
+
+    def run_adb_command(self, command):
+        """
+        Runs a single adb command without showing a console window.
+        """
+        creationflags = 0
+        if os.name == 'nt':
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        p = subprocess.Popen(
+            ["adb"] + command.split(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+            creationflags=creationflags
+        )
+        stdout, stderr = p.communicate()
+        return p.returncode, stdout, stderr
 
     def update_status(self, msg):
         """Update the status label text."""
         self.status_label.config(text=f"Status: {msg}")
         self.master.update_idletasks()
 
-
 def main():
     root = tk.Tk()
     app = ADBLogCaptureApp(root)
+    # Make the window resize gracefully
+    root.rowconfigure(0, weight=1)
+    root.columnconfigure(0, weight=1)
     root.mainloop()
 
 if __name__ == "__main__":
